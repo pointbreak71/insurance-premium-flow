@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.xlsx
+*.pdf
+*.docx
+*.png
+*.jpg
+precipitation-colombia/

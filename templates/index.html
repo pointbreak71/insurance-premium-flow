@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Insurance Premium Flow</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h1>Insurance Premium Flow</h1>
+      </div>
+
+      <section class="control-section">
+        <label class="section-label">Total Premium</label>
+        <div class="input-row">
+          <span class="prefix">$</span>
+          <input type="number" id="totalPremium" value="100" min="1" step="1" />
+        </div>
+      </section>
+
+      <section class="control-section">
+        <div class="section-header-row">
+          <label class="section-label">Fee Bands</label>
+          <button class="btn-add" id="addFeeBtn">+ Add</button>
+        </div>
+        <div id="feeBands"></div>
+      </section>
+
+      <section class="control-section">
+        <label class="section-label">Carrier Split</label>
+        <div class="carrier-controls">
+          <div class="input-row labeled">
+            <span class="prefix">$</span>
+            <input type="number" id="claimsActual" value="42" min="0" step="0.1" />
+            <span class="field-label">Claims paid</span>
+          </div>
+          <div class="input-row labeled">
+            <input type="number" id="targetLossRatio" value="65" min="0" max="100" step="0.1" />
+            <span class="suffix">% target LR</span>
+          </div>
+          <div class="input-row labeled">
+            <input type="number" id="mgaContingentPct" value="30" min="0" max="100" step="0.1" />
+            <span class="suffix">% MGA contingent</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="control-section">
+        <label class="section-label">Bar Width</label>
+        <div class="input-row labeled">
+          <input type="range" id="nodeWidth" min="60" max="180" value="100" style="flex:1" />
+          <span id="nodeWidthVal" class="suffix">100px</span>
+        </div>
+      </section>
+    </aside>
+
+    <main id="main">
+      <div id="chart-container">
+        <svg id="sankey-svg"></svg>
+      </div>
+    </main>
+  </div>
+
+  <template id="feeBandTpl">
+    <div class="fee-band" data-id="">
+      <div class="fee-band-row">
+        <input type="color" class="fee-color" value="#7C5CBF" title="Band colour" />
+        <input type="text" class="fee-label" placeholder="Fee label" value="" />
+        <button class="btn-delete" title="Remove">×</button>
+      </div>
+      <div class="fee-band-row">
+        <label class="toggle-label">
+          <input type="radio" class="fee-mode" name="" value="dollar" checked /> $
+        </label>
+        <label class="toggle-label">
+          <input type="radio" class="fee-mode" name="" value="percent" /> %
+        </label>
+        <input type="number" class="fee-value" value="5" min="0" step="0.1" style="flex:1" />
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/sankey.js"></script>
+  <script>
+    let feeIdCounter = 0;
+
+    const defaultFees = [
+      { label: "Finding the client",    value: 8, mode: "dollar", color: "#7C5CBF" },
+      { label: "Managing the risk",     value: 6, mode: "dollar", color: "#4F8A6E" },
+      { label: "Admin & claims",        value: 4, mode: "dollar", color: "#D4762A" },
+      { label: "Arranging reinsurance", value: 3, mode: "dollar", color: "#C2487A" },
+    ];
+
+    function getState() {
+      const total            = parseFloat(document.getElementById("totalPremium").value)     || 100;
+      const claimsInput      = parseFloat(document.getElementById("claimsActual").value)     || 0;
+      const targetLR         = parseFloat(document.getElementById("targetLossRatio").value)  / 100 || 0.65;
+      const mgaContingentPct = parseFloat(document.getElementById("mgaContingentPct").value) / 100 || 0.30;
+      const nodeWidth        = parseInt(document.getElementById("nodeWidth").value)           || 100;
+
+      const fees = [];
+      document.querySelectorAll(".fee-band").forEach(el => {
+        const label  = el.querySelector(".fee-label").value || "Fee";
+        const color  = el.querySelector(".fee-color").value;
+        const mode   = el.querySelector(".fee-mode:checked").value;
+        const rawVal = parseFloat(el.querySelector(".fee-value").value) || 0;
+        const value  = mode === "percent" ? (rawVal / 100) * total : rawVal;
+        fees.push({ label, color, value });
+      });
+
+      const totalFees        = fees.reduce((s, f) => s + f.value, 0);
+      const premiumAfterFees = Math.max(0, total - totalFees);
+      const claimsActual     = Math.min(Math.max(0, claimsInput), premiumAfterFees);
+
+      // Carrier profits = fixed target-based slice, eaten into on overrun
+      const isOverrun      = claimsActual >= premiumAfterFees * targetLR;
+      const carrierProfits = isOverrun
+        ? Math.max(0, premiumAfterFees - claimsActual)
+        : premiumAfterFees * (1 - targetLR);
+
+      // Contingent profits = everything left after claims and carrier profits
+      const contingentProfits = Math.max(0, premiumAfterFees - claimsActual - carrierProfits);
+
+      // Split contingent between MGA and carrier
+      const mgaContingentAmount      = contingentProfits * mgaContingentPct;
+      const carrierContingentAmount  = contingentProfits * (1 - mgaContingentPct);
+
+      const realisedLR           = premiumAfterFees > 0 ? claimsActual / premiumAfterFees : 0;
+      const realisedProfitRatioPct = ((1 - realisedLR) * 100).toFixed(1);
+
+      return {
+        total, fees, totalFees, premiumAfterFees,
+        claimsActual, targetLR, realisedLR, realisedProfitRatioPct,
+        carrierProfits, contingentProfits,
+        mgaContingentAmount, carrierContingentAmount,
+        isOverrun, nodeWidth,
+      };
+    }
+
+    function addFeeBand(fee = null) {
+      const id = ++feeIdCounter;
+      const tpl = document.getElementById("feeBandTpl").content.cloneNode(true);
+      const div = tpl.querySelector(".fee-band");
+      div.dataset.id = id;
+
+      const radioName = `fee-mode-${id}`;
+      div.querySelectorAll(".fee-mode").forEach(r => r.name = radioName);
+
+      if (fee) {
+        div.querySelector(".fee-label").value = fee.label;
+        div.querySelector(".fee-color").value = fee.color;
+        div.querySelector(".fee-value").value = fee.value;
+        if (fee.mode === "percent") {
+          div.querySelectorAll(".fee-mode")[1].checked = true;
+          div.querySelectorAll(".fee-mode")[0].checked = false;
+        }
+      }
+
+      div.querySelector(".btn-delete").addEventListener("click", () => {
+        div.remove();
+        scheduleRender();
+      });
+      div.querySelectorAll("input").forEach(inp => inp.addEventListener("input", scheduleRender));
+      document.getElementById("feeBands").appendChild(div);
+    }
+
+    document.getElementById("addFeeBtn").addEventListener("click", () => {
+      const palette = ["#7C5CBF","#4F8A6E","#D4762A","#C2487A","#3A78B5","#B58A1A"];
+      addFeeBand({ label: "New fee", value: 5, mode: "dollar",
+        color: palette[document.querySelectorAll(".fee-band").length % palette.length] });
+      scheduleRender();
+    });
+
+    let renderTimer = null;
+    function scheduleRender() {
+      clearTimeout(renderTimer);
+      renderTimer = setTimeout(() => renderSankey(getState()), 60);
+    }
+
+    ["totalPremium","claimsActual","targetLossRatio","mgaContingentPct"].forEach(id =>
+      document.getElementById(id).addEventListener("input", scheduleRender));
+
+    document.getElementById("nodeWidth").addEventListener("input", () => {
+      document.getElementById("nodeWidthVal").textContent =
+        document.getElementById("nodeWidth").value + "px";
+      scheduleRender();
+    });
+
+    defaultFees.forEach(f => addFeeBand(f));
+    scheduleRender();
+  </script>
+</body>
+</html>
