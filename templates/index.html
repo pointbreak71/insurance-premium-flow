@@ -35,15 +35,15 @@
         <div class="carrier-controls">
           <div class="input-row labeled">
             <span class="prefix">$</span>
-            <input type="number" id="claimsActual" value="42" min="0" step="0.1" />
+            <input type="number" id="claimsActual" value="42" min="0" step="1" />
             <span class="field-label">Claims paid</span>
           </div>
           <div class="input-row labeled">
-            <input type="number" id="targetLossRatio" value="65" min="0" max="100" step="0.1" />
+            <input type="number" id="targetLossRatio" value="65" min="0" max="100" step="1" />
             <span class="suffix">% target LR</span>
           </div>
           <div class="input-row labeled">
-            <input type="number" id="mgaContingentPct" value="30" min="0" max="100" step="0.1" />
+            <input type="number" id="mgaContingentPct" value="30" min="0" max="100" step="1" />
             <span class="suffix">% MGA contingent</span>
           </div>
         </div>
@@ -79,7 +79,7 @@
         <label class="toggle-label">
           <input type="radio" class="fee-mode" name="" value="percent" /> %
         </label>
-        <input type="number" class="fee-value" value="5" min="0" step="0.1" style="flex:1" />
+        <input type="number" class="fee-value" value="5" min="0" step="1" style="flex:1" />
       </div>
     </div>
   </template>
@@ -114,7 +114,7 @@
 
       const totalFees        = fees.reduce((s, f) => s + f.value, 0);
       const premiumAfterFees = Math.max(0, total - totalFees);
-      const claimsActual     = Math.min(Math.max(0, claimsInput), premiumAfterFees);
+      const claimsActual     = Math.max(0, claimsInput);  // uncapped — can exceed premiumAfterFees
 
       // Carrier profits = fixed target-based slice, eaten into on overrun
       const isOverrun      = claimsActual >= premiumAfterFees * targetLR;

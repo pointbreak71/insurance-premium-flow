@@ -1,21 +1,21 @@
-/* ── Insurance Premium Flow — Sankey renderer v3 ───────────────────────────
+/* ── Insurance Premium Flow — Sankey renderer v4 ───────────────────────────
    Four-column layout:
      col0  Premium bar
      col1  Allocation after fees  (carrier grey + fee bands peeling off below)
      col2  Allocation after claims (claims / carrier profits / contingent profits)
      col3  Contingent split        (carrier contingent / MGA contingent) — only if >0
 
-   Ribbon geometry (waterfall style, spec §6):
-     Top edge:    M(x0,y0_top) C(mx,y0_top)(mx,y1_top)(x1,y1_top)
-     Right side:  L(x1,y1_bot)
-     Bottom edge: C(mx,y1_bot)(mx,y0_bot)(x0,y0_bot)   [reversed, but reads downward L→R]
-     Close:       Z
-   Control points sit at the midpoint x, anchored to each endpoint's y.
-   This produces a smooth S‑curve that never bends upward when
-   y1_top >= y0_top and y1_bot >= y0_bot (the waterfall invariant).
+   Claims can exceed premiumAfterFees — the red bar extends beyond the other
+   columns and the scale adjusts so claims fill the chart height exactly.
 
-   Superimposed labels on col1 carrier, col2, col3 bars use a drop-shadow
-   SVG filter so white text stays legible on any bar colour.
+   Waterfall ribbon geometry (spec §6):
+     M(x0,y0_top) C(mx,y0_top)(mx,y1_top)(x1,y1_top)
+     L(x1,y1_bot)
+     C(mx,y1_bot)(mx,y0_bot)(x0,y0_bot) Z
+   Control points at midpoint x, anchored at each endpoint's y.
+
+   Bar labels are clipped to bar bounds via SVG clipPath and wrap to as many
+   lines as fit (LINE_H = 14 px per line).
 ──────────────────────────────────────────────────────────────────────────── */
 (function () {
 
@@ -24,32 +24,29 @@
     carrier:          "#888780",
     claims:           "#A32D2D",
     carrierProfits:   "#0F6E56",
-    contingent:       "#1A9E8A",  // merged teal band at col2
-    carrierContingent:"#0D6E60",  // dark teal, col3 top
-    mgaContingent:    "#185FA5",  // blue,       col3 bottom
+    contingent:       "#1A9E8A",
+    carrierContingent:"#0D6E60",
+    mgaContingent:    "#185FA5",
   };
 
   // ── Formatters ─────────────────────────────────────────────────────────────
   function fmt(v) {
     if (Math.abs(v) >= 1e6) return "$" + d3.format(",.2s")(v);
-    if (Math.abs(v) >= 1000) return "$" + d3.format(",.0f")(v);
-    return "$" + d3.format(",.2f")(v);
+    return "$" + d3.format(",.0f")(v);
   }
   function fmtPct(v, total) {
     if (!total) return "—";
-    return (v / total * 100).toFixed(1) + "%";
+    return (v / total * 100).toFixed(0) + "%";
   }
 
-  // ── Waterfall ribbon (spec §6 geometry) ────────────────────────────────────
-  // x0/x1 = left/right bar edges, y0/y1 = top y, h0/h1 = heights
-  // Invariant for clean waterfall: y1 >= y0 and y1+h1 >= y0+h0
+  // ── Waterfall ribbon ───────────────────────────────────────────────────────
   function ribbon(x0, y0, h0, x1, y1, h1) {
     const mx = (x0 + x1) / 2;
     return [
       `M${x0},${y0}`,
-      `C${mx},${y0} ${mx},${y1} ${x1},${y1}`,           // top edge L→R
-      `L${x1},${y1 + h1}`,                               // right side down
-      `C${mx},${y1 + h1} ${mx},${y0 + h0} ${x0},${y0 + h0}`, // bottom edge R→L
+      `C${mx},${y0} ${mx},${y1} ${x1},${y1}`,
+      `L${x1},${y1 + h1}`,
+      `C${mx},${y1 + h1} ${mx},${y0 + h0} ${x0},${y0 + h0}`,
       `Z`,
     ].join(" ");
   }
@@ -76,8 +73,8 @@
 
     // ── Drop-shadow filter for superimposed labels ─────────────────────────
     const filt = defs.append("filter").attr("id", "tshadow")
-      .attr("x", "-10%").attr("y", "-30%")
-      .attr("width", "120%").attr("height", "160%");
+      .attr("x", "-20%").attr("y", "-40%")
+      .attr("width", "140%").attr("height", "180%");
     filt.append("feDropShadow")
       .attr("dx", 0).attr("dy", 0)
       .attr("stdDeviation", 2.5)
@@ -90,14 +87,14 @@
     const iH = H - M.top  - M.bottom;
     const g  = svg.append("g").attr("transform", `translate(${M.left},${M.top})`);
 
-    // Always reserve space for 4 columns so layout doesn't jump
     const colGap = Math.min(180, Math.max(80, (iW - NW * 4) / 3));
     const col0 = 0;
     const col1 = col0 + NW + colGap;
     const col2 = col1 + NW + colGap;
     const col3 = col2 + NW + colGap;
 
-    const sc = iH / total;   // px per dollar
+    // Scale: claims can exceed total, so fit whichever is taller
+    const sc = iH / Math.max(total, claimsActual);
 
     // ── Stage 1: carrier (top) + fee bands (below) ────────────────────────
     const carrierH = premiumAfterFees * sc;
@@ -111,13 +108,16 @@
     });
 
     // ── Stage 2: carrier split ────────────────────────────────────────────
-    const claimsH    = Math.max(0, claimsActual)    * sc;
-    const profitsH   = Math.max(0, carrierProfits)   * sc;
-    const contH      = Math.max(0, contingentProfits) * sc;
+    const claimsH  = Math.max(0, claimsActual)     * sc;
+    const profitsH = Math.max(0, carrierProfits)    * sc;
+    const contH    = Math.max(0, contingentProfits) * sc;
 
     const claimsY  = 0;
     const profitsY = claimsY  + claimsH;
     const contY    = profitsY + profitsH;
+
+    // When claims > paf the ribbon fans out from the full carrier band
+    const claimsSrcH = Math.min(claimsH, carrierH);
 
     // ── Stage 3: contingent split ─────────────────────────────────────────
     const carrContH = Math.max(0, carrierContingentAmount) * sc;
@@ -165,35 +165,45 @@
         .attr("fill", `url(#${grad})`).attr("opacity", 0.36);
     }
 
-    // ── Superimposed bar label (white, drop-shadow) ────────────────────────
-    // Always centered on the bar. Two lines when bar is tall enough.
-    const MIN_2LINE = 26;
-    const MIN_SHOW  = 8;
+    // ── Superimposed bar label (white, drop-shadow, clipped) ───────────────
+    // Variadic lines: first uses lbl-bar-primary, rest lbl-bar-secondary.
+    // Lines are clipped to the bar rect and wrapped to as many as fit.
+    const LINE_H   = 14;   // px between baselines
+    const MIN_SHOW = 8;
+    let   clipSeq  = 0;
 
-    function lblBar(colX, barY, barH, line1, line2) {
-      if (barH < MIN_SHOW) return;
-      const cx = colX + NW / 2;
-      const cy = barY + barH / 2;
-      const grp = labelG.append("g").attr("transform", `translate(${cx},${cy})`);
+    function lblBar(colX, barY, barH, ...lines) {
+      if (barH < MIN_SHOW || !lines.length) return;
 
-      const showTwo = barH >= MIN_2LINE && line2;
-      grp.append("text")
-        .attr("class", "lbl-bar-primary")
-        .attr("text-anchor", "middle")
-        .attr("dy", showTwo ? "-0.45em" : "0.35em")
-        .attr("filter", "url(#tshadow)")
-        .text(line1);
-      if (showTwo) {
-        grp.append("text")
-          .attr("class", "lbl-bar-secondary")
+      // Clip group to bar bounds (coordinates are in g's space)
+      const cid = `clip-bar-${clipSeq++}`;
+      defs.append("clipPath").attr("id", cid)
+        .append("rect")
+          .attr("x", colX).attr("y", barY)
+          .attr("width", NW).attr("height", barH);
+
+      const clpG = labelG.append("g").attr("clip-path", `url(#${cid})`);
+
+      const maxFit  = Math.max(1, Math.floor(barH / LINE_H));
+      const visible = lines.slice(0, maxFit);
+      const n       = visible.length;
+      const cx      = colX + NW / 2;
+      const firstY  = barY + barH / 2 - (n - 1) * LINE_H / 2;
+
+      visible.forEach((line, i) => {
+        clpG.append("text")
+          .attr("class", i === 0 ? "lbl-bar-primary" : "lbl-bar-secondary")
           .attr("text-anchor", "middle")
-          .attr("dy", "0.85em")
+          .attr("x", cx)
+          .attr("y", firstY + i * LINE_H)
+          .attr("dy", "0.35em")
           .attr("filter", "url(#tshadow)")
-          .text(line2);
-      }
+          .text(line);
+      });
     }
 
-    // Left-of-bar label (for col0 premium bar)
+    // Left-of-bar label (col0 premium bar)
+    const MIN_2LINE = 26;
     function lblLeft(barX, barY, barH, line1, line2) {
       if (barH < MIN_SHOW) return;
       const x = barX - 10;
@@ -209,11 +219,8 @@
     }
 
     // ── Col 0→1 ribbons ────────────────────────────────────────────────────
-    // Carrier band flows straight across (y0==y1 → flat, correct)
-    drawRibbon(col0 + NW, 0,         carrierH, col1, 0,      carrierH, "gCarr");
+    drawRibbon(col0 + NW, 0, carrierH, col1, 0, carrierH, "gCarr");
 
-    // Fee bands peel off downward. Source and dest have same stacking
-    // (invariant holds: dst_top >= src_top for downward peel).
     let srcFeeY = carrierH;
     feeRects.forEach((fr, i) => {
       drawRibbon(col0 + NW, srcFeeY, fr.h, col1, fr.y, fr.h, `gFee${fr.idx}`);
@@ -221,33 +228,27 @@
     });
 
     // ── Col 1→2 ribbons ────────────────────────────────────────────────────
-    // All three bands originate within the carrier section [0, carrierH] of col1.
-    drawRibbon(col1 + NW, claimsY,  claimsH,  col2, claimsY,  claimsH,  "gClaim");
-    drawRibbon(col1 + NW, profitsY, profitsH,  col2, profitsY, profitsH,  "gProfit");
+    // Claims ribbon: source capped to carrier band height (fan-out on overrun)
+    drawRibbon(col1 + NW, claimsY,  claimsSrcH, col2, claimsY,  claimsH,  "gClaim");
+    drawRibbon(col1 + NW, profitsY, profitsH,   col2, profitsY, profitsH,  "gProfit");
     if (hasContingent) {
       drawRibbon(col1 + NW, contY, contH, col2, contY, contH, "gCont");
     }
 
-    // ── Col 2→3 ribbons (contingent split) ────────────────────────────────
+    // ── Col 2→3 ribbons ────────────────────────────────────────────────────
     if (hasContingent) {
       drawRibbon(col2 + NW, carrContY, carrContH, col3, carrContY, carrContH, "gCCont");
       drawRibbon(col2 + NW, mgaContY,  mgaContH,  col3, mgaContY,  mgaContH,  "gMCont");
     }
 
     // ── Bars ──────────────────────────────────────────────────────────────
-    // col0
     drawRect(col0, 0, total * sc, C.premium);
-    // col1
-    drawRect(col1, 0,      carrierH, C.carrier);
+    drawRect(col1, 0, carrierH,   C.carrier);
     feeRects.forEach(fr => drawRect(col1, fr.y, fr.h, fr.color));
-    // col2
     drawRect(col2, claimsY,  claimsH,  C.claims);
-    drawRect(col2, profitsY, profitsH,  C.carrierProfits);
+    drawRect(col2, profitsY, profitsH, C.carrierProfits);
     if (hasContingent) {
-      drawRect(col2, contY, contH, C.contingent);
-    }
-    // col3
-    if (hasContingent) {
+      drawRect(col2, contY,     contH,    C.contingent);
       drawRect(col3, carrContY, carrContH, C.carrierContingent);
       drawRect(col3, mgaContY,  mgaContH,  C.mgaContingent);
     }
@@ -268,11 +269,12 @@
     // ── Col 0: premium label (left of bar) ────────────────────────────────
     lblLeft(col0, 0, total * sc, fmt(total), "Total premium");
 
-    // ── Col 1: carrier bar superimposed label ─────────────────────────────
-    lblBar(col1, 0, carrierH, fmt(premiumAfterFees), "Premium after fees");
+    // ── Col 1: carrier bar label ──────────────────────────────────────────
+    lblBar(col1, 0, carrierH,
+      fmt(premiumAfterFees),
+      "Premium after fees");
 
-    // ── Col 1: fee band labels (external, right of bar, with leader lines) ─
-    // Push-apart so labels don't collide
+    // ── Col 1: fee band labels (external, push-apart) ─────────────────────
     let lblPos = feeRects.map(fr => ({ fr, ly: fr.y + fr.h / 2 }));
     const MIN_GAP = 17;
     for (let pass = 0; pass < 12; pass++) {
@@ -308,21 +310,21 @@
     });
 
     // ── Col 2: superimposed labels ────────────────────────────────────────
-    // Claims
     lblBar(col2, claimsY, claimsH,
       fmt(claimsActual),
-      `Claims  ·  ${(realisedLR * 100).toFixed(1)}% realised LR`);
+      "Claims paid",
+      `${(realisedLR * 100).toFixed(0)}% realised LR`);
 
-    // Carrier profits
     lblBar(col2, profitsY, profitsH,
       fmt(carrierProfits),
-      `Carrier profits  ·  ${realisedProfitRatioPct}% realised profit ratio`);
+      "Carrier profits",
+      `${(+realisedProfitRatioPct).toFixed(0)}% profit ratio`);
 
-    // Contingent profits (merged)
     if (hasContingent) {
       lblBar(col2, contY, contH,
         fmt(contingentProfits),
-        `${fmtPct(contingentProfits, premiumAfterFees)} of premium after fees`);
+        "Contingent profits",
+        `${fmtPct(contingentProfits, premiumAfterFees)} of PAF`);
     }
 
     // ── Col 3: superimposed labels ────────────────────────────────────────
@@ -335,12 +337,11 @@
         "MGA contingent");
     }
 
-    // ── Originator fees bracket (between col1 and col2) ───────────────────
+    // ── Originator fees bracket ───────────────────────────────────────────
     if (feeRects.length > 0 && totalFees > 0) {
       const fy1 = feeRects[0].y;
       const fy2 = feeRects[feeRects.length - 1].y + feeRects[feeRects.length - 1].h;
       if (fy2 - fy1 > 6) {
-        // Place bracket at 75% of the gap so it stays right of fee labels
         const bx = col1 + NW + Math.min(colGap * 0.72, colGap - 28);
         const my = (fy1 + fy2) / 2;
         const bg = g.append("g").attr("class", "bracket-group");
