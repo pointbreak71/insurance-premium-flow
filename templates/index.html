@@ -42,10 +42,14 @@
             <input type="number" id="targetLossRatio" value="65" min="0" max="100" step="1" />
             <span class="suffix">% target LR</span>
           </div>
-          <div class="input-row labeled">
+          <div class="input-row labeled" id="mgaContingentRow">
             <input type="number" id="mgaContingentPct" value="30" min="0" max="100" step="1" />
             <span class="suffix">% MGA contingent</span>
           </div>
+          <label class="option-toggle">
+            <input type="checkbox" id="slidingProfits" />
+            <span>Sliding profits</span>
+          </label>
         </div>
       </section>
 
@@ -101,6 +105,7 @@
       const targetLR         = parseFloat(document.getElementById("targetLossRatio").value)  / 100 || 0.65;
       const mgaContingentPct = parseFloat(document.getElementById("mgaContingentPct").value) / 100 || 0.30;
       const nodeWidth        = parseInt(document.getElementById("nodeWidth").value)           || 100;
+      const slidingProfits   = document.getElementById("slidingProfits").checked;
 
       const fees = [];
       document.querySelectorAll(".fee-band").forEach(el => {
@@ -125,11 +130,14 @@
       // Contingent profits = everything left after claims and carrier profits
       const contingentProfits = Math.max(0, premiumAfterFees - claimsActual - carrierProfits);
 
-      // Split contingent between MGA and carrier
-      const mgaContingentAmount      = contingentProfits * mgaContingentPct;
-      const carrierContingentAmount  = contingentProfits * (1 - mgaContingentPct);
+      // Split contingent: sliding mode locks MGA at 50% of contingent (decreases linearly to 0
+      // as claims rise, mirroring how contingent profits themselves shrink to 0)
+      const mgaContingentAmount     = slidingProfits
+        ? contingentProfits * 0.5
+        : contingentProfits * mgaContingentPct;
+      const carrierContingentAmount = contingentProfits - mgaContingentAmount;
 
-      const realisedLR           = premiumAfterFees > 0 ? claimsActual / premiumAfterFees : 0;
+      const realisedLR             = premiumAfterFees > 0 ? claimsActual / premiumAfterFees : 0;
       const realisedProfitRatioPct = ((1 - realisedLR) * 100).toFixed(1);
 
       return {
@@ -137,7 +145,7 @@
         claimsActual, targetLR, realisedLR, realisedProfitRatioPct,
         carrierProfits, contingentProfits,
         mgaContingentAmount, carrierContingentAmount,
-        isOverrun, nodeWidth,
+        isOverrun, slidingProfits, nodeWidth,
       };
     }
 
@@ -183,6 +191,14 @@
 
     ["totalPremium","claimsActual","targetLossRatio","mgaContingentPct"].forEach(id =>
       document.getElementById(id).addEventListener("input", scheduleRender));
+
+    document.getElementById("slidingProfits").addEventListener("change", () => {
+      const on  = document.getElementById("slidingProfits").checked;
+      const row = document.getElementById("mgaContingentRow");
+      row.style.opacity = on ? "0.35" : "1";
+      row.querySelector("input").disabled = on;
+      scheduleRender();
+    });
 
     document.getElementById("nodeWidth").addEventListener("input", () => {
       document.getElementById("nodeWidthVal").textContent =

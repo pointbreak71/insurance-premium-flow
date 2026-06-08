@@ -1,21 +1,18 @@
-/* ── Insurance Premium Flow — Sankey renderer v4 ───────────────────────────
-   Four-column layout:
+/* ── Insurance Premium Flow — Sankey renderer v5 ───────────────────────────
+   Five-column layout:
      col0  Premium bar
      col1  Allocation after fees  (carrier grey + fee bands peeling off below)
      col2  Allocation after claims (claims / carrier profits / contingent profits)
      col3  Contingent split        (carrier contingent / MGA contingent) — only if >0
+     col4  Final Split             (claims / carrier total / MGA total) — always shown
 
-   Claims can exceed premiumAfterFees — the red bar extends beyond the other
-   columns and the scale adjusts so claims fill the chart height exactly.
+   Sliding profits: when enabled, MGA contingent = 50% of contingent profits.
+   Because contingent profits shrink linearly to $0 as claims rise, MGA's
+   absolute dollar amount also slides linearly down to $0 in the same fashion.
 
-   Waterfall ribbon geometry (spec §6):
-     M(x0,y0_top) C(mx,y0_top)(mx,y1_top)(x1,y1_top)
-     L(x1,y1_bot)
-     C(mx,y1_bot)(mx,y0_bot)(x0,y0_bot) Z
-   Control points at midpoint x, anchored at each endpoint's y.
-
-   Bar labels are clipped to bar bounds via SVG clipPath and wrap to as many
-   lines as fit (LINE_H = 14 px per line).
+   Final Split bar height = total * sc, divided proportionally among the three
+   buckets. When claims > paf (overrun) the three buckets are renormalised so
+   the bar never overflows.
 ──────────────────────────────────────────────────────────────────────────── */
 (function () {
 
@@ -27,6 +24,7 @@
     contingent:       "#1A9E8A",
     carrierContingent:"#0D6E60",
     mgaContingent:    "#185FA5",
+    mgaTotal:         "#7C5CBF",   // purple — MGA's aggregate bucket in Final Split
   };
 
   // ── Formatters ─────────────────────────────────────────────────────────────
@@ -81,19 +79,20 @@
       .attr("flood-color", "#000")
       .attr("flood-opacity", 0.85);
 
-    // ── Layout ────────────────────────────────────────────────────────────
+    // ── Layout (5 columns always reserved) ───────────────────────────────
     const M = { top: 44, bottom: 36, left: 104, right: 80 };
     const iW = W - M.left - M.right;
     const iH = H - M.top  - M.bottom;
     const g  = svg.append("g").attr("transform", `translate(${M.left},${M.top})`);
 
-    const colGap = Math.min(180, Math.max(80, (iW - NW * 4) / 3));
+    const colGap = Math.min(140, Math.max(50, (iW - NW * 5) / 4));
     const col0 = 0;
     const col1 = col0 + NW + colGap;
     const col2 = col1 + NW + colGap;
     const col3 = col2 + NW + colGap;
+    const col4 = col3 + NW + colGap;
 
-    // Scale: claims can exceed total, so fit whichever is taller
+    // Scale: claims can exceed total — fit whichever is taller
     const sc = iH / Math.max(total, claimsActual);
 
     // ── Stage 1: carrier (top) + fee bands (below) ────────────────────────
@@ -113,8 +112,8 @@
     const contH    = Math.max(0, contingentProfits) * sc;
 
     const claimsY  = 0;
-    const profitsY = claimsY  + claimsH;
-    const contY    = profitsY + profitsH;
+    const profitsY = claimsH;
+    const contY    = claimsH + profitsH;
 
     // When claims > paf the ribbon fans out from the full carrier band
     const claimsSrcH = Math.min(claimsH, carrierH);
@@ -124,6 +123,21 @@
     const mgaContH  = Math.max(0, mgaContingentAmount)     * sc;
     const carrContY = contY;
     const mgaContY  = carrContY + carrContH;
+
+    // ── Stage 4: final split ──────────────────────────────────────────────
+    const finalClaims  = claimsActual;
+    const finalCarrier = carrierProfits + carrierContingentAmount;
+    const finalMGA     = totalFees + mgaContingentAmount;
+    const finalSum     = finalClaims + finalCarrier + finalMGA;
+    const finalBarH    = total * sc;
+    // Renormalise when overrun (finalSum > total) so bar never overflows
+    const fsc          = finalSum > 0 ? finalBarH / finalSum : 0;
+    const col4ClaimsH  = finalClaims  * fsc;
+    const col4CarrierH = finalCarrier * fsc;
+    const col4MGAH     = finalMGA     * fsc;
+    const col4ClaimsY  = 0;
+    const col4CarrierY = col4ClaimsH;
+    const col4MGAY     = col4ClaimsH + col4CarrierH;
 
     // ── Gradients ─────────────────────────────────────────────────────────
     function addGrad(id, hex) {
@@ -141,6 +155,7 @@
     addGrad("gCont",   C.contingent);
     addGrad("gCCont",  C.carrierContingent);
     addGrad("gMCont",  C.mgaContingent);
+    addGrad("gMGATot", C.mgaTotal);
     fees.forEach((f, i) => addGrad(`gFee${i}`, f.color));
 
     // ── Layers (z-order: ribbons → bars → labels) ─────────────────────────
@@ -166,29 +181,25 @@
     }
 
     // ── Superimposed bar label (white, drop-shadow, clipped) ───────────────
-    // Variadic lines: first uses lbl-bar-primary, rest lbl-bar-secondary.
-    // Lines are clipped to the bar rect and wrapped to as many as fit.
-    const LINE_H   = 14;   // px between baselines
+    const LINE_H   = 14;
     const MIN_SHOW = 8;
     let   clipSeq  = 0;
 
     function lblBar(colX, barY, barH, ...lines) {
       if (barH < MIN_SHOW || !lines.length) return;
 
-      // Clip group to bar bounds (coordinates are in g's space)
       const cid = `clip-bar-${clipSeq++}`;
       defs.append("clipPath").attr("id", cid)
         .append("rect")
           .attr("x", colX).attr("y", barY)
           .attr("width", NW).attr("height", barH);
 
-      const clpG = labelG.append("g").attr("clip-path", `url(#${cid})`);
-
-      const maxFit  = Math.max(1, Math.floor(barH / LINE_H));
+      const clpG  = labelG.append("g").attr("clip-path", `url(#${cid})`);
+      const maxFit = Math.max(1, Math.floor(barH / LINE_H));
       const visible = lines.slice(0, maxFit);
-      const n       = visible.length;
-      const cx      = colX + NW / 2;
-      const firstY  = barY + barH / 2 - (n - 1) * LINE_H / 2;
+      const n      = visible.length;
+      const cx     = colX + NW / 2;
+      const firstY = barY + barH / 2 - (n - 1) * LINE_H / 2;
 
       visible.forEach((line, i) => {
         clpG.append("text")
@@ -228,7 +239,6 @@
     });
 
     // ── Col 1→2 ribbons ────────────────────────────────────────────────────
-    // Claims ribbon: source capped to carrier band height (fan-out on overrun)
     drawRibbon(col1 + NW, claimsY,  claimsSrcH, col2, claimsY,  claimsH,  "gClaim");
     drawRibbon(col1 + NW, profitsY, profitsH,   col2, profitsY, profitsH,  "gProfit");
     if (hasContingent) {
@@ -248,10 +258,21 @@
     drawRect(col2, claimsY,  claimsH,  C.claims);
     drawRect(col2, profitsY, profitsH, C.carrierProfits);
     if (hasContingent) {
-      drawRect(col2, contY,     contH,    C.contingent);
+      drawRect(col2, contY,     contH,     C.contingent);
       drawRect(col3, carrContY, carrContH, C.carrierContingent);
       drawRect(col3, mgaContY,  mgaContH,  C.mgaContingent);
     }
+
+    // col4 Final Split — separator then bars
+    g.append("line")
+      .attr("x1", col4 - colGap * 0.45).attr("x2", col4 - colGap * 0.45)
+      .attr("y1", -M.top + 8).attr("y2", iH + M.bottom - 8)
+      .attr("stroke", "#ddd").attr("stroke-width", 1)
+      .attr("stroke-dasharray", "4,3").attr("opacity", 0.7);
+
+    drawRect(col4, col4ClaimsY,  col4ClaimsH,  C.claims);
+    drawRect(col4, col4CarrierY, col4CarrierH, C.carrierProfits);
+    drawRect(col4, col4MGAY,     col4MGAH,     C.mgaTotal);
 
     // ── Column headers ────────────────────────────────────────────────────
     const headers = [
@@ -260,6 +281,7 @@
       { x: col2 + NW / 2, t: "Allocation after claims" },
     ];
     if (hasContingent) headers.push({ x: col3 + NW / 2, t: "Contingent split" });
+    headers.push({ x: col4 + NW / 2, t: "Final Split" });
 
     headers.forEach(({ x, t }) =>
       g.append("text").attr("class", "col-header")
@@ -336,6 +358,22 @@
         fmt(mgaContingentAmount),
         "MGA contingent");
     }
+
+    // ── Col 4: Final Split labels ─────────────────────────────────────────
+    lblBar(col4, col4ClaimsY, col4ClaimsH,
+      fmt(finalClaims),
+      "Claims",
+      `${fmtPct(finalClaims, total)} of premium`);
+
+    lblBar(col4, col4CarrierY, col4CarrierH,
+      fmt(finalCarrier),
+      "Carrier",
+      `${fmtPct(finalCarrier, total)} of premium`);
+
+    lblBar(col4, col4MGAY, col4MGAH,
+      fmt(finalMGA),
+      "MGA",
+      `${fmtPct(finalMGA, total)} of premium`);
 
     // ── Originator fees bracket ───────────────────────────────────────────
     if (feeRects.length > 0 && totalFees > 0) {
