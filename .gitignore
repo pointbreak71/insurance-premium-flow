@@ -1,11 +1,20 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Data files (large — do not commit raw downloads)
+data/raw/*.tif
+data/raw/*.nc
+data/raw/*.zip
+*.npz
+
+# OS
 .DS_Store
-*.xlsx
-*.pdf
-*.docx
-*.png
-*.jpg
-precipitation-colombia/
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
