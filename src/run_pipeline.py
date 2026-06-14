@@ -545,20 +545,30 @@ log("C3 — solving MVP optimisation …")
 
 def solve_mvp(Sigma, mu, constrained=False):
     n = len(mu)
+    # Use symmetric positive-definite matrix
+    Sigma_psd = (Sigma + Sigma.T) / 2 + 1e-6 * np.eye(n)
     w = cp.Variable(n)
-    objective = cp.Minimize(cp.quad_form(w, Sigma))
+    objective = cp.Minimize(cp.quad_form(w, cp.Parameter(shape=(n,n), value=Sigma_psd, PSD=True)))
     constraints = [cp.sum(w) == 1, w >= 0]
     if constrained:
         constraints += [w <= 0.25]
     prob = cp.Problem(objective, constraints)
-    try:
-        prob.solve(solver=cp.CLARABEL, verbose=False)
-    except Exception:
-        prob.solve(solver=cp.SCS, verbose=False)
+    for solver in [cp.SCS, cp.ECOS, None]:
+        try:
+            if solver:
+                prob.solve(solver=solver, verbose=False)
+            else:
+                prob.solve(verbose=False)
+            if w.value is not None:
+                break
+        except Exception:
+            continue
     if w.value is None:
         flag("C3 solver returned None; using uniform weights")
         return np.ones(n) / n
-    return np.clip(w.value, 0, None) / np.clip(w.value, 0, None).sum()
+    wv = np.clip(w.value, 0, None)
+    total = wv.sum()
+    return wv / total if total > 0 else np.ones(n) / n
 
 w_unc = solve_mvp(Sigma, mu, constrained=False)
 w_con = solve_mvp(Sigma, mu, constrained=True)
@@ -584,16 +594,26 @@ log(f"C3 — Constrained   MVP: std=${stats_con['std_dev']:,.0f}, DR={stats_con[
 mu_min, mu_max = mu.min(), mu.max()
 frontier_targets = np.linspace(mu_min, mu_max, 20)
 frontier_rows = []
+Sigma_psd_f = (Sigma + Sigma.T) / 2 + 1e-6 * np.eye(len(mu))
 for target in frontier_targets:
     n = len(mu)
     w = cp.Variable(n)
-    objective = cp.Minimize(cp.quad_form(w, Sigma))
+    Sp = cp.Parameter(shape=(n,n), value=Sigma_psd_f, PSD=True)
+    objective = cp.Minimize(cp.quad_form(w, Sp))
     constraints = [cp.sum(w) == 1, w >= 0, w @ mu >= target]
     prob = cp.Problem(objective, constraints)
-    try:
-        prob.solve(solver=cp.CLARABEL, verbose=False)
-    except Exception:
-        prob.solve(solver=cp.SCS, verbose=False)
+    solved = False
+    for solver in [cp.SCS, cp.ECOS, None]:
+        try:
+            if solver:
+                prob.solve(solver=solver, verbose=False)
+            else:
+                prob.solve(verbose=False)
+            if w.value is not None:
+                solved = True
+                break
+        except Exception:
+            continue
     if w.value is not None:
         wv = np.clip(w.value, 0, None)
         wv /= wv.sum()
