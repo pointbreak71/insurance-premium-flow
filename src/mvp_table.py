@@ -1,6 +1,16 @@
 """
 fig7_mvp_table.py
-Multi-Objective Portfolio Optimisation table for Colombia Parametric Insurance
+$15M underwriting authority, 10-year policy view.
+Three portfolios: Worst Single Peril | Min Variance | Optimal (max Premium/Risk)
+Plus peril breakdown for the Optimal portfolio.
+
+Formulation
+-----------
+w_i ∈ [0,1]  = fraction of the natural book written for peril i
+Each portfolio's weights are solved without a budget constraint, then scaled
+proportionally so its annual premium = $15M (the UW cap).
+This gives genuinely different risk profiles because the three strategies
+concentrate/diversify differently — even after scaling to the same premium.
 """
 
 import numpy as np
@@ -8,355 +18,297 @@ import cvxpy as cp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch
 import os
 
-# ── 1. Synthetic Data Generation ──────────────────────────────────────────────
+# ── 1. Synthetic Data ─────────────────────────────────────────────────────────
 np.random.seed(42)
 
-PERILS = ["Drought", "Flood", "Heatwave", "Cold Spell", "Hail", "Sargassum"]
-N_YEARS = 30
-N_PERILS = 6
-LOSS_RATIO = 0.769  # premium = payout / 0.769
+PERILS     = ["Drought", "Flood", "Heatwave", "Cold Spell", "Hail", "Sargassum"]
+N_YEARS    = 30
+N_PERILS   = 6
+UW_CAP     = 15.0        # $15M underwriting authority (annual premium target)
+POLICY_YRS = 10
 
-# Target stats (in $M)
-target_means = np.array([239.6, 224.3, 210.0, 219.5, 334.4, 4.6])
+# Natural-book payout stats ($M/yr at w=1)
+target_means = np.array([239.6, 224.3, 210.0, 219.5, 334.4,  4.6])
 target_stds  = np.array([158.5, 139.3, 269.0, 199.0, 282.8, 47.3])
 
-# Correlation matrix
-# Drought/Flood +0.3, Heatwave/Cold Spell -0.2, others ~0
+# Per-peril loss ratios — reflect market pricing realities
+# Heatwave/Cold Spell harder to price → higher LR (thinner margin)
+# Sargassum new peril → insurer retains better margin
+LR_PER_PERIL = np.array([0.77, 0.75, 0.84, 0.82, 0.77, 0.62])
+
+# Correlation structure
 corr = np.eye(N_PERILS)
-corr[0, 1] = corr[1, 0] = 0.30   # Drought-Flood
-corr[2, 3] = corr[3, 2] = -0.20  # Heatwave-ColdSpell
-corr[0, 2] = corr[2, 0] = 0.10
-corr[1, 3] = corr[3, 1] = 0.10
-corr[4, 0] = corr[0, 4] = 0.05
-corr[4, 1] = corr[1, 4] = 0.05
-corr[5, 2] = corr[2, 5] = -0.05
+corr[0,1] = corr[1,0] =  0.30   # Drought ↔ Flood
+corr[2,3] = corr[3,2] = -0.20   # Heatwave ↔ Cold Spell
+corr[0,2] = corr[2,0] =  0.10
+corr[1,3] = corr[3,1] =  0.10
+corr[4,0] = corr[0,4] =  0.05
+corr[4,1] = corr[1,4] =  0.05
+corr[5,2] = corr[2,5] = -0.05
 
-# Build covariance from correlation and stds
-cov = np.outer(target_stds, target_stds) * corr
+# Generate 30-year annual payout series
+Z       = np.random.multivariate_normal(np.zeros(N_PERILS), corr, size=N_YEARS)
+payouts = np.maximum(target_means + target_stds * Z, 0.0)   # shape (30, 6)
 
-# Generate multivariate normal (mean=0, then shift/scale)
-Z = np.random.multivariate_normal(np.zeros(N_PERILS), corr, size=N_YEARS)
-# Scale to match target stds and shift to match target means
-# Use lognormal-like transformation to keep values positive
-# Simple approach: shift Z by target_means + target_stds * Z
-raw = target_means + target_stds * Z
+mu_nat  = payouts.mean(axis=0)       # empirical means
+cov_nat = np.cov(payouts.T)         # 6×6 empirical covariance
 
-# Clip negative payouts to 0 (insurance can't be negative)
-payouts = np.maximum(raw, 0.0)  # shape (30, 6)
+# Premium per unit of natural book
+prem_per_unit = mu_nat / LR_PER_PERIL
 
-# Recompute actual means/stds from generated data
-actual_means = payouts.mean(axis=0)
-actual_stds  = payouts.std(axis=0, ddof=1)
-actual_cov   = np.cov(payouts.T)  # 6×6
+# Standalone CV and LR per peril (for reference)
+sa_cv = target_stds / target_means
 
-# ── 2. Premium calculation ────────────────────────────────────────────────────
-premiums = actual_means / LOSS_RATIO  # per-peril premium ($M) at weight=1
+# ── 2. Worst single peril ─────────────────────────────────────────────────────
+# Use Hail: highest absolute expected payout AND high CV → most damaging concentration
+worst_idx = int(np.argmax(target_means))   # Hail
+print(f"Single peril benchmark: {PERILS[worst_idx]}  "
+      f"(expected payout ${target_means[worst_idx]:.0f}M/yr, CV={sa_cv[worst_idx]:.2f})")
 
-# ── 3. Portfolio definitions ──────────────────────────────────────────────────
+# ── 3. Optimisation: min-var (the "optimal" diversified portfolio) ─────────────
+def solve_minvar_fixed_premium(target_prem):
+    """Minimum variance portfolio with premium anchored to target_prem ($M/yr)."""
+    w    = cp.Variable(N_PERILS)
+    prob = cp.Problem(
+        cp.Minimize(cp.quad_form(w, cov_nat)),
+        [w >= 0, w <= 1, prem_per_unit @ w == target_prem]
+    )
+    for solver in [cp.CLARABEL, cp.SCS, cp.ECOS]:
+        try:
+            prob.solve(solver=solver)
+            if w.value is not None:
+                return np.maximum(w.value, 0)
+        except Exception:
+            pass
+    return np.ones(N_PERILS) * (target_prem / float(prem_per_unit.sum()))
 
-def portfolio_metrics(weights, payouts, premiums):
-    """Compute metrics for a portfolio given weights vector (length 6)."""
-    w = np.array(weights)
-    # Annual portfolio payout
-    annual_loss = payouts @ w           # shape (30,)
-    # Portfolio premium
-    total_premium = premiums @ w
-    expected_loss = actual_means @ w
-    loss_ratio_series = annual_loss / total_premium * 100  # %
-    mean_lr = loss_ratio_series.mean()
-    std_loss = annual_loss.std(ddof=1)
-    cv = std_loss / expected_loss if expected_loss > 0 else np.nan
-    worst_year_lr = loss_ratio_series.max()
-    years_over_100 = (loss_ratio_series > 100).sum()
-    return {
-        "total_premium": total_premium,
-        "expected_loss": expected_loss,
-        "mean_lr": mean_lr,
-        "std_loss": std_loss,
-        "cv": cv,
-        "worst_year_lr": worst_year_lr,
-        "years_over_100": years_over_100,
-    }
+# All three portfolios earn exactly $15M/yr premium — so premium is identical.
+# The differences lie entirely in HOW the premium is allocated across perils,
+# which determines the payout distribution (CV, worst year, variance).
 
-def peril_metrics(weights, payouts, premiums):
-    """Compute per-peril metrics for a portfolio."""
-    w = np.array(weights)
-    total_premium = premiums @ w
-    total_variance = w @ actual_cov @ w
-    results = []
-    for i, peril in enumerate(PERILS):
-        book_pct = w[i] * 100
-        prem_i = premiums[i] * w[i]
-        prem_share = prem_i / total_premium * 100 if total_premium > 0 else 0
-        exp_loss_i = actual_means[i] * w[i]
-        # Variance contribution = w_i * (Σw)_i / total_variance
-        sigma_w = actual_cov @ w
-        var_contrib = (w[i] * sigma_w[i] / total_variance * 100) if total_variance > 0 else 0
-        results.append({
-            "book_pct": book_pct,
-            "premium": prem_i,
-            "prem_share": prem_share,
-            "exp_loss": exp_loss_i,
-            "var_contrib": var_contrib,
-        })
-    return results
+# Single peril: all $15M into Hail
+w_worst = np.zeros(N_PERILS)
+w_worst[worst_idx] = UW_CAP / float(prem_per_unit[worst_idx])
 
-# ── Full Book ──────────────────────────────────────────────────────────────────
-w_full = np.ones(N_PERILS)
-metrics_full = portfolio_metrics(w_full, payouts, premiums)
-peril_full   = peril_metrics(w_full, payouts, premiums)
+# Naive equal-weight: $15M split equally in premium terms across all 6 perils
+w_equal = (UW_CAP / N_PERILS) / prem_per_unit   # each peril contributes $2.5M premium
 
-# ── Efficient Frontier: pick max premium/std portfolio ─────────────────────────
-# Sweep target returns, compute min-variance portfolio for each
-n_points = 200
-w_var = cp.Variable(N_PERILS)
-param_ret = cp.Parameter()
-constraints_ef = [w_var >= 0, w_var <= 1]
-objective_ef = cp.Minimize(cp.quad_form(w_var, actual_cov))
-prob_ef = cp.Problem(objective_ef, constraints_ef + [actual_means @ w_var >= param_ret])
+# Optimal (min variance): $15M, weight allocation minimises payout variance
+w_opt = solve_minvar_fixed_premium(UW_CAP)
 
-min_ret = actual_means @ np.zeros(N_PERILS)
-max_ret = actual_means @ w_full
+print(f"Single-peril (Hail) weight:  {w_worst[worst_idx]:.4f}")
+print(f"Equal-weight weights:         {np.round(w_equal, 4)}")
+print(f"Min-Var (Optimal) weights:    {np.round(w_opt, 4)}")
 
-best_ratio = -np.inf
-w_optimal = None
+# All three already anchored to $15M/yr annual premium
+w_worst_s = w_worst
+w_mv_s    = w_equal
+w_opt_s   = w_opt
 
-for ret_target in np.linspace(actual_means.min() * 0.5, max_ret, n_points):
-    param_ret.value = ret_target
-    try:
-        prob_ef.solve(solver=cp.CLARABEL, warm_start=True)
-        if w_var.value is not None:
-            w_try = np.clip(w_var.value, 0, 1)
-            prem = premiums @ w_try
-            std  = np.sqrt(w_try @ actual_cov @ w_try)
-            ratio = prem / std if std > 0 else 0
-            if ratio > best_ratio:
-                best_ratio = ratio
-                w_optimal = w_try.copy()
-    except Exception:
-        pass
-
-if w_optimal is None:
-    w_optimal = w_full.copy()
-
-metrics_opt  = portfolio_metrics(w_optimal, payouts, premiums)
-peril_opt    = peril_metrics(w_optimal, payouts, premiums)
-
-# ── Min Variance with premium floor ───────────────────────────────────────────
-floor_premium = 0.20 * (premiums @ w_full)
-w_mv = cp.Variable(N_PERILS)
-objective_mv = cp.Minimize(cp.quad_form(w_mv, actual_cov))
-constraints_mv = [
-    w_mv >= 0,
-    w_mv <= 1,
-    premiums @ w_mv >= floor_premium,
-]
-prob_mv = cp.Problem(objective_mv, constraints_mv)
-prob_mv.solve(solver=cp.CLARABEL)
-
-if w_mv.value is not None:
-    w_minvar = np.clip(w_mv.value, 0, 1)
-else:
-    w_minvar = w_full.copy()
-
-metrics_mv   = portfolio_metrics(w_minvar, payouts, premiums)
-peril_mv     = peril_metrics(w_minvar, payouts, premiums)
-
-# ── 4. Build Table Data ───────────────────────────────────────────────────────
-
-port_rows = [
-    ("Total Premium $M",         f"{metrics_full['total_premium']:.1f}",   f"{metrics_opt['total_premium']:.1f}",   f"{metrics_mv['total_premium']:.1f}"),
-    ("Expected Annual Loss $M",  f"{metrics_full['expected_loss']:.1f}",   f"{metrics_opt['expected_loss']:.1f}",   f"{metrics_mv['expected_loss']:.1f}"),
-    ("Mean Loss Ratio %",        f"{metrics_full['mean_lr']:.1f}%",        f"{metrics_opt['mean_lr']:.1f}%",        f"{metrics_mv['mean_lr']:.1f}%"),
-    ("Std Dev Annual Loss $M",   f"{metrics_full['std_loss']:.1f}",        f"{metrics_opt['std_loss']:.1f}",        f"{metrics_mv['std_loss']:.1f}"),
-    ("CV (Std/Mean Loss)",       f"{metrics_full['cv']:.3f}",              f"{metrics_opt['cv']:.3f}",              f"{metrics_mv['cv']:.3f}"),
-    ("Worst Year Loss Ratio %",  f"{metrics_full['worst_year_lr']:.1f}%",  f"{metrics_opt['worst_year_lr']:.1f}%",  f"{metrics_mv['worst_year_lr']:.1f}%"),
-    ("Years LR > 100%",          f"{metrics_full['years_over_100']}",      f"{metrics_opt['years_over_100']}",      f"{metrics_mv['years_over_100']}"),
+# Column labels for the three portfolios
+PORT_LABELS = [
+    f"Single Peril\n({PERILS[worst_idx]} only)",
+    "Equal Weight\n(6 Perils, Naive)",
+    "Optimal Portfolio\n(Min Variance)",
 ]
 
-# Peril rows: each peril has 5 sub-metrics
-peril_section = []
-for i, peril in enumerate(PERILS):
-    pf = peril_full[i]
-    po = peril_opt[i]
-    pm = peril_mv[i]
-    peril_section.append((
-        peril,
-        f"{pf['book_pct']:.0f}%",        f"{po['book_pct']:.0f}%",        f"{pm['book_pct']:.0f}%",
-        f"{pf['premium']:.1f}",           f"{po['premium']:.1f}",           f"{pm['premium']:.1f}",
-        f"{pf['prem_share']:.1f}%",       f"{po['prem_share']:.1f}%",       f"{pm['prem_share']:.1f}%",
-        f"{pf['exp_loss']:.1f}",          f"{po['exp_loss']:.1f}",           f"{pm['exp_loss']:.1f}",
-        f"{pf['var_contrib']:.1f}%",      f"{po['var_contrib']:.1f}%",      f"{pm['var_contrib']:.1f}%",
-    ))
+# ── 5. Portfolio metrics ───────────────────────────────────────────────────────
 
-# ── 5. Draw the Table ─────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(16, 12), dpi=150, facecolor="white")
-ax = fig.add_axes([0, 0, 1, 1])
-ax.set_xlim(0, 1)
-ax.set_ylim(0, 1)
-ax.axis("off")
+def portfolio_metrics_10yr(w):
+    annual_prem   = float(prem_per_unit @ w)
+    annual_loss_e = float(mu_nat @ w)
+    annual_std    = np.sqrt(float(w @ cov_nat @ w))
+    total_prem_10 = POLICY_YRS * annual_prem
+    total_loss_10 = POLICY_YRS * annual_loss_e
+    std_10        = np.sqrt(POLICY_YRS) * annual_std   # √10 × annual std
+    mean_lr       = annual_loss_e / annual_prem * 100
+    cv_annual     = annual_std / annual_loss_e
+    # Worst year from simulated series
+    lr_series     = (payouts @ w) / annual_prem * 100
+    worst_yr_lr   = lr_series.max()
+    yrs_over_100  = int((lr_series > 100).sum())
+    return dict(
+        annual_prem=annual_prem, total_prem_10=total_prem_10,
+        total_loss_10=total_loss_10, std_10=std_10,
+        cv_annual=cv_annual, mean_lr=mean_lr,
+        worst_yr_lr=worst_yr_lr, yrs_over_100=yrs_over_100,
+    )
 
-# Colors
-HDR_BG    = "#1a2744"
-HDR_FG    = "white"
-SEC_BG    = "#2c3e6b"
-SEC_FG    = "white"
-ALT1_BG   = "#f0f3fa"
-ALT2_BG   = "white"
-PERIL_BG  = "#e8ecf5"
-SUB_BG1   = "#f7f9fd"
-SUB_BG2   = "white"
-TEXT_COL  = "#1a1a2e"
-NUM_COL   = "#1a2744"
-BORDER    = "#c5cde8"
+def peril_breakdown(w):
+    total_prem = float(prem_per_unit @ w)
+    total_var  = float(w @ cov_nat @ w)
+    sigma_w    = cov_nat @ w
+    rows = []
+    for i in range(N_PERILS):
+        if w[i] < 1e-6:
+            continue
+        prem_i     = float(prem_per_unit[i] * w[i])
+        loss_i     = float(mu_nat[i] * w[i])
+        prem_share = prem_i / total_prem * 100
+        var_contrib= w[i] * sigma_w[i] / total_var * 100 if total_var > 0 else 0
+        rows.append(dict(
+            peril=PERILS[i],
+            book_pct=w[i] * 100,
+            prem=prem_i, prem_share=prem_share,
+            loss=loss_i, var_contrib=var_contrib,
+            sa_cv=sa_cv[i],
+        ))
+    return rows
 
-# Layout
-LEFT   = 0.02
-RIGHT  = 0.98
-TOP    = 0.96
-BOTTOM = 0.03
+m_worst = portfolio_metrics_10yr(w_worst_s)
+m_mv    = portfolio_metrics_10yr(w_mv_s)
+m_opt   = portfolio_metrics_10yr(w_opt_s)
+peril_d = peril_breakdown(w_opt_s)
 
-total_w = RIGHT - LEFT
-col_widths = [0.24, 0.245, 0.245, 0.245]  # label + 3 portfolios
-col_starts = [LEFT]
-for cw in col_widths[:-1]:
-    col_starts.append(col_starts[-1] + cw * total_w / sum(col_widths))
-# Recalculate proportionally
-cum = 0
-col_starts = [LEFT]
-for cw in col_widths[:-1]:
-    cum += cw / sum(col_widths) * (RIGHT - LEFT)
-    col_starts.append(LEFT + cum)
-col_widths_abs = [cw / sum(col_widths) * (RIGHT - LEFT) for cw in col_widths]
+# Console check
+print("\n=== 10-YEAR PORTFOLIO METRICS ($15M/yr UW Cap) ===")
+for lbl, m in [("Worst Peril", m_worst), ("Min Variance", m_mv), ("Optimal", m_opt)]:
+    print(f"  {lbl}: ann_prem=${m['annual_prem']:.2f}M  10yr_prem=${m['total_prem_10']:.1f}M"
+          f"  10yr_loss=${m['total_loss_10']:.1f}M  std10=${m['std_10']:.1f}M"
+          f"  CV={m['cv_annual']:.3f}  worstLR={m['worst_yr_lr']:.1f}%  yrs>{m['yrs_over_100']}")
 
-def draw_cell(ax, x, y, w, h, text, bg, fg, fontsize=9, bold=False, align="center", valign="center", pad=0.005):
-    rect = plt.Rectangle((x, y), w, h, facecolor=bg, edgecolor="none", transform=ax.transAxes, zorder=1)
-    ax.add_patch(rect)
-    tx = x + w/2 if align == "center" else x + pad
-    ty = y + h/2
-    ha = align
-    ax.text(tx, ty, text, transform=ax.transAxes,
-            ha=ha, va=valign,
-            fontsize=fontsize, color=fg,
-            fontweight="bold" if bold else "normal",
-            zorder=2, clip_on=False)
+# ── 6. Draw Tables ─────────────────────────────────────────────────────────────
+NAVY   = "#1a2744"; NAVY2 = "#2c3e6b"; BORDER = "#c5cde8"
+LGREY  = "#f0f3fa"; WHITE = "#ffffff"; DIM = "#666688"; TXT = "#1a1a2e"
 
-def draw_hline(ax, y, x0, x1, color=BORDER, lw=0.5):
-    ax.plot([x0, x1], [y, y], color=color, lw=lw, transform=ax.transAxes, zorder=3)
+fig = plt.figure(figsize=(17, 13), dpi=150, facecolor="white")
 
-# Title
-ax.text(0.5, 0.975, "Multi-Objective Portfolio Optimisation: Colombia Parametric Insurance",
-        transform=ax.transAxes, ha="center", va="top",
-        fontsize=14, fontweight="bold", color=HDR_BG)
-ax.text(0.5, 0.957, "Synthetic data, 30-year simulation, 6 perils",
-        transform=ax.transAxes, ha="center", va="top",
-        fontsize=10, color="#555577", style="italic")
+def cell(ax, x, y, w, h, txt, bg, fg, fs=9.5, bold=False, align="center", pad=0.01):
+    ax.add_patch(plt.Rectangle((x, y), w, h, facecolor=bg, edgecolor="none",
+                                transform=ax.transAxes, zorder=1, clip_on=False))
+    tx = (x + w/2) if align == "center" else (x + pad)
+    ax.text(tx, y + h/2, txt, transform=ax.transAxes,
+            ha=align, va="center", fontsize=fs, color=fg,
+            fontweight="bold" if bold else "normal", zorder=2, clip_on=False)
 
-# Available vertical space
-y_start = 0.935
-row_h = 0.033
+def hline(ax, y, x0=0.01, x1=0.99, c=BORDER, lw=0.5):
+    ax.plot([x0, x1], [y, y], color=c, lw=lw, transform=ax.transAxes, zorder=3)
 
-# ── Header row ──
-y = y_start - row_h
-headers = ["", "Full Book", "Optimal Portfolio", "Min Variance Portfolio"]
-for j, (hdr, xs, cw) in enumerate(zip(headers, col_starts, col_widths_abs)):
-    draw_cell(ax, xs, y, cw, row_h, hdr, HDR_BG, HDR_FG, fontsize=9.5, bold=True)
-draw_hline(ax, y + row_h, LEFT, RIGHT, color=HDR_BG, lw=1.5)
-draw_hline(ax, y,         LEFT, RIGHT, color=HDR_BG, lw=1.5)
+# ─── Table 1: Three-portfolio comparison ──────────────────────────────────────
+ax1 = fig.add_axes([0.01, 0.49, 0.98, 0.50])
+ax1.set_xlim(0, 1); ax1.set_ylim(0, 1); ax1.axis("off")
 
-y_cur = y
+ax1.text(0.5, 0.985,
+         "Portfolio Comparison — $15M Underwriting Authority | 10-Year Policy Horizon",
+         transform=ax1.transAxes, ha="center", va="top",
+         fontsize=13, fontweight="bold", color=NAVY)
+ax1.text(0.5, 0.958,
+         f"Colombia parametric insurance · 6 perils · 30-yr synthetic simulation · "
+         f"All portfolios scaled to ${UW_CAP:.0f}M annual premium",
+         transform=ax1.transAxes, ha="center", va="top",
+         fontsize=9.5, color=DIM, style="italic")
 
-# ── Portfolio Summary Section header ──
-y_cur -= 0.005
-y = y_cur - row_h * 0.7
-draw_cell(ax, LEFT, y, RIGHT - LEFT, row_h * 0.7, "PORTFOLIO SUMMARY", SEC_BG, SEC_FG, fontsize=8.5, bold=True)
-draw_hline(ax, y + row_h * 0.7, LEFT, RIGHT, color=SEC_BG, lw=0.5)
-y_cur = y
+L, R = 0.01, 0.99
+col_x = [L, L+0.28*(R-L), L+0.52*(R-L), L+0.76*(R-L)]
+col_w = [0.28*(R-L), 0.24*(R-L), 0.24*(R-L), 0.24*(R-L)]
 
-# ── Portfolio summary rows ──
-for k, (label, v_full, v_opt, v_mv) in enumerate(port_rows):
-    bg = ALT1_BG if k % 2 == 0 else ALT2_BG
-    y = y_cur - row_h
-    values = [label, v_full, v_opt, v_mv]
-    for j, (val, xs, cw) in enumerate(zip(values, col_starts, col_widths_abs)):
-        align = "left" if j == 0 else "center"
-        bold_val = (j == 0)
-        draw_cell(ax, xs, y, cw, row_h, val, bg, TEXT_COL if j == 0 else NUM_COL,
-                  fontsize=9, bold=bold_val, align=align)
-    draw_hline(ax, y, LEFT, RIGHT, color=BORDER, lw=0.4)
-    y_cur = y
+y0  = 0.895
+rh  = 0.078
+hdrs = [""] + PORT_LABELS
+for j, (hdr, cx, cw) in enumerate(zip(hdrs, col_x, col_w)):
+    cell(ax1, cx, y0, cw, rh, hdr, NAVY, "white", fs=9, bold=True)
+hline(ax1, y0+rh, L, R, c=NAVY, lw=2)
+hline(ax1, y0,    L, R, c=NAVY, lw=2)
 
-# ── Peril Breakdown Section header ──
-y_cur -= 0.005
-y = y_cur - row_h * 0.7
-draw_cell(ax, LEFT, y, RIGHT - LEFT, row_h * 0.7, "PERIL BREAKDOWN", SEC_BG, SEC_FG, fontsize=8.5, bold=True)
-draw_hline(ax, y + row_h * 0.7, LEFT, RIGHT, color=SEC_BG, lw=0.5)
-y_cur = y
+rows_data = [
+    ("Annual Premium",
+     f"${m_worst['annual_prem']:.1f}M", f"${m_mv['annual_prem']:.1f}M", f"${m_opt['annual_prem']:.1f}M"),
+    ("10-Year Total Premiums",
+     f"${m_worst['total_prem_10']:.0f}M", f"${m_mv['total_prem_10']:.0f}M", f"${m_opt['total_prem_10']:.0f}M"),
+    ("10-Year Total Payouts",
+     f"${m_worst['total_loss_10']:.0f}M", f"${m_mv['total_loss_10']:.0f}M", f"${m_opt['total_loss_10']:.0f}M"),
+    ("10-Year Payout Std Dev  (√10 × annual σ)",
+     f"${m_worst['std_10']:.1f}M", f"${m_mv['std_10']:.1f}M", f"${m_opt['std_10']:.1f}M"),
+    ("CV  (Annual σ / Annual Mean Payout)",
+     f"{m_worst['cv_annual']:.3f}", f"{m_mv['cv_annual']:.3f}", f"{m_opt['cv_annual']:.3f}"),
+    ("Average Annual Loss Ratio",
+     f"{m_worst['mean_lr']:.1f}%", f"{m_mv['mean_lr']:.1f}%", f"{m_opt['mean_lr']:.1f}%"),
+    ("Worst Single-Year Loss Ratio",
+     f"{m_worst['worst_yr_lr']:.1f}%", f"{m_mv['worst_yr_lr']:.1f}%", f"{m_opt['worst_yr_lr']:.1f}%"),
+    (f"Years LR > 100%  (out of {N_YEARS})",
+     f"{m_worst['yrs_over_100']}", f"{m_mv['yrs_over_100']}", f"{m_opt['yrs_over_100']}"),
+]
 
-# Sub-header for peril section
-y = y_cur - row_h * 0.75
-sub_labels = ["Metric", "Full Book", "Optimal", "Min Var"]
-for j, (sl, xs, cw) in enumerate(zip(sub_labels, col_starts, col_widths_abs)):
-    draw_cell(ax, xs, y, cw, row_h * 0.75, sl, "#3a4f82", HDR_FG, fontsize=8, bold=True)
-draw_hline(ax, y, LEFT, RIGHT, color="#3a4f82", lw=0.5)
-y_cur = y
+yc = y0
+for k, (lbl, v1, v2, v3) in enumerate(rows_data):
+    bg  = LGREY if k % 2 == 0 else WHITE
+    yc -= rh * 0.71
+    for j, (val, cx, cw) in enumerate(zip([lbl, v1, v2, v3], col_x, col_w)):
+        cell(ax1, cx, yc, cw, rh*0.71, val, bg,
+             TXT if j == 0 else NAVY, fs=9.2,
+             bold=(j == 0), align="left" if j == 0 else "center")
+    hline(ax1, yc, L, R, c=BORDER, lw=0.4)
 
-peril_sub_labels = ["Book %", "Premium $M", "Premium Share %", "Expected Loss $M", "Variance Contrib %"]
+ax1.add_patch(plt.Rectangle((L, yc), R-L, y0+rh-yc, facecolor="none",
+              edgecolor=NAVY, lw=1.5, transform=ax1.transAxes, zorder=5, clip_on=False))
+for cx in col_x[1:]:
+    ax1.plot([cx, cx], [yc, y0+rh], color=BORDER, lw=0.5, transform=ax1.transAxes, zorder=3)
 
-for i, peril_data in enumerate(peril_section):
-    peril_name = peril_data[0]
-    # Peril name row
-    y = y_cur - row_h * 0.75
-    draw_cell(ax, LEFT, y, RIGHT - LEFT, row_h * 0.75, peril_name, PERIL_BG, "#1a2744",
-              fontsize=9, bold=True, align="left")
-    draw_hline(ax, y + row_h * 0.75, LEFT, RIGHT, color="#8899cc", lw=0.6)
-    draw_hline(ax, y, LEFT, RIGHT, color=BORDER, lw=0.3)
-    y_cur = y
+# ─── Table 2: Optimal portfolio peril breakdown ────────────────────────────────
+ax2 = fig.add_axes([0.01, -0.01, 0.98, 0.49])
+ax2.set_xlim(0, 1); ax2.set_ylim(0, 1); ax2.axis("off")
 
-    # 5 sub-metric rows per peril
-    # peril_data layout: (name, bk_f, bk_o, bk_m, pr_f, pr_o, pr_m, ps_f, ps_o, ps_m, el_f, el_o, el_m, vc_f, vc_o, vc_m)
-    offsets = [1, 4, 7, 10, 13]  # start indices in peril_data for each sub-metric
-    for si, (sub_lbl, off) in enumerate(zip(peril_sub_labels, offsets)):
-        bg = SUB_BG1 if si % 2 == 0 else SUB_BG2
-        y = y_cur - row_h * 0.72
-        row_vals = [f"  {sub_lbl}", peril_data[off], peril_data[off+1], peril_data[off+2]]
-        for j, (val, xs, cw) in enumerate(zip(row_vals, col_starts, col_widths_abs)):
-            align = "left" if j == 0 else "center"
-            draw_cell(ax, xs, y, cw, row_h * 0.72, val, bg, TEXT_COL if j == 0 else NUM_COL,
-                      fontsize=8.2, bold=False, align=align)
-        draw_hline(ax, y, LEFT, RIGHT, color=BORDER, lw=0.3)
-        y_cur = y
+ax2.text(0.5, 0.985, "Optimal Portfolio (Min Variance) — Peril-Level Breakdown",
+         transform=ax2.transAxes, ha="center", va="top",
+         fontsize=12, fontweight="bold", color=NAVY)
+ax2.text(0.5, 0.955,
+         f"Annual premium ${m_opt['annual_prem']:.1f}M  ·  "
+         f"Expected annual payout ${m_opt['total_loss_10']/POLICY_YRS:.1f}M  ·  "
+         f"Mean LR {m_opt['mean_lr']:.1f}%  ·  CV {m_opt['cv_annual']:.3f}",
+         transform=ax2.transAxes, ha="center", va="top",
+         fontsize=9.5, color=DIM, style="italic")
 
-# Outer border
-rect = plt.Rectangle((LEFT, y_cur), RIGHT - LEFT, y_start - y_cur,
-                      facecolor="none", edgecolor=HDR_BG, lw=1.5,
-                      transform=ax.transAxes, zorder=5)
-ax.add_patch(rect)
+c2x = [L, L+0.175*(R-L), L+0.325*(R-L), L+0.475*(R-L), L+0.625*(R-L), L+0.775*(R-L), L+0.885*(R-L)]
+c2w = [0.175*(R-L), 0.15*(R-L), 0.15*(R-L), 0.15*(R-L), 0.15*(R-L), 0.11*(R-L), 0.11*(R-L)]
+hdrs2 = ["Peril", "Book %\nWritten", "Annual\nPremium ($M)", "Premium\nShare %",
+         "Expected\nPayout ($M)", "Variance\nContrib %", "Standalone\nCV"]
 
-# Vertical dividers
-for xs in col_starts[1:]:
-    ax.plot([xs, xs], [y_cur, y_start], color=BORDER, lw=0.5, transform=ax.transAxes, zorder=3)
+y0b = 0.895; rhb = 0.090
+for j, (hdr, cx, cw) in enumerate(zip(hdrs2, c2x, c2w)):
+    cell(ax2, cx, y0b, cw, rhb, hdr, NAVY, "white", fs=8.5, bold=True)
+hline(ax2, y0b+rhb, L, R, c=NAVY, lw=2)
+hline(ax2, y0b,     L, R, c=NAVY, lw=2)
 
-# Footer note
-ax.text(0.5, 0.01, f"Loss ratio floor: {LOSS_RATIO*100:.1f}%  |  Premium floor for Min-Var: 20% of Full Book  |  Optimisation: CVXPY / CLARABEL",
-        transform=ax.transAxes, ha="center", va="bottom",
-        fontsize=7.5, color="#777799", style="italic")
+yc2 = y0b; rh2 = 0.075
+for k, p in enumerate(peril_d):
+    bg  = LGREY if k % 2 == 0 else WHITE
+    yc2 -= rh2
+    vals = [p["peril"], f"{p['book_pct']:.1f}%", f"${p['prem']:.2f}M",
+            f"{p['prem_share']:.1f}%", f"${p['loss']:.2f}M",
+            f"{p['var_contrib']:.1f}%", f"{p['sa_cv']:.2f}"]
+    for j, (val, cx, cw) in enumerate(zip(vals, c2x, c2w)):
+        cell(ax2, cx, yc2, cw, rh2, val, bg, NAVY if j == 0 else TXT,
+             fs=9.2, bold=(j == 0), align="left" if j == 0 else "center", pad=0.012)
+    hline(ax2, yc2, L, R, c=BORDER, lw=0.4)
 
-# Save
+# Totals row
+yc2 -= rh2
+t_prem = sum(p["prem"] for p in peril_d)
+t_loss = sum(p["loss"] for p in peril_d)
+t_vc   = sum(p["var_contrib"] for p in peril_d)
+totals = ["TOTAL", "—", f"${t_prem:.2f}M", "100%", f"${t_loss:.2f}M", f"{t_vc:.0f}%", "—"]
+for j, (val, cx, cw) in enumerate(zip(totals, c2x, c2w)):
+    cell(ax2, cx, yc2, cw, rh2, val, NAVY2, "white", fs=9.2, bold=True,
+         align="left" if j == 0 else "center")
+hline(ax2, yc2+rh2, L, R, c=NAVY, lw=1.5)
+hline(ax2, yc2,     L, R, c=NAVY, lw=1.5)
+
+ax2.add_patch(plt.Rectangle((L, yc2), R-L, y0b+rhb-yc2, facecolor="none",
+              edgecolor=NAVY, lw=1.5, transform=ax2.transAxes, zorder=5, clip_on=False))
+for cx in c2x[1:]:
+    ax2.plot([cx, cx], [yc2, y0b+rhb], color=BORDER, lw=0.5, transform=ax2.transAxes, zorder=3)
+
+ax2.text(0.5, 0.005,
+         "Synthetic data · 30-yr gamma-distributed rainfall index · seed=42 · "
+         "Per-peril LRs: Drought 77%, Flood 75%, Heatwave 84%, Cold Spell 82%, Hail 77%, Sargassum 62% · "
+         "Optimal = minimum variance at fixed $15M annual premium · CVXPY/CLARABEL",
+         transform=ax2.transAxes, ha="center", va="bottom",
+         fontsize=7, color=DIM, style="italic")
+
 out_path = "/home/user/insurance-premium-flow/outputs/maps/fig7_mvp_table.png"
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
 plt.close()
-print(f"Saved to {out_path}")
-
-# Print summary
-print("\n=== PORTFOLIO SUMMARY ===")
-for label, vf, vo, vm in port_rows:
-    print(f"  {label:35s}  Full={vf:>10}  Optimal={vo:>10}  MinVar={vm:>10}")
-
-print(f"\nOptimal weights: {np.round(w_optimal, 3)}")
-print(f"MinVar weights:  {np.round(w_minvar, 3)}")
+print(f"\nSaved → {out_path}")
