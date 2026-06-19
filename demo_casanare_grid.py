@@ -10,6 +10,7 @@ import geopandas as gpd
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.ticker
 import matplotlib.lines as mlines
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Patch
@@ -123,38 +124,14 @@ valid = arr[~np.isnan(arr)]
 print(f"\nRice stats: {len(valid)} cells, "
       f"total={valid.sum()/1000:.0f}k ha, max={valid.max():.0f} ha/cell")
 
-# ── Aggregate rice ha per municipality ───────────────────────────────────────
-from shapely.geometry import box as sbox
-
-muni_ha = {}
-for _, mrow in casanare_munis.iterrows():
-    muni_geom = mrow.geometry
-    name = mrow.get("shapeName", "Unknown")
-    total = 0.0
-    for ri in range(ROWS):
-        for ci in range(COLS):
-            cell = sbox(lons[ci], lats[ri], lons[ci+1], lats[ri+1])
-            val  = arr[ROWS - 1 - ri, ci]
-            if np.isnan(val):
-                continue
-            if cell.intersects(muni_geom):
-                overlap = cell.intersection(muni_geom).area / cell.area
-                total += float(val) * overlap
-    muni_ha[name] = total
-
-muni_names  = sorted(muni_ha, key=muni_ha.get, reverse=True)
-muni_values = [muni_ha[n] / 1_000 for n in muni_names]   # → thousands of ha
-
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(18, 10), dpi=110)
-ax  = fig.add_axes([0.03, 0.06, 0.40, 0.88])   # map (left)
-ax2 = fig.add_axes([0.52, 0.06, 0.44, 0.88])   # bar chart (right)
+fig, ax = plt.subplots(figsize=(10, 9), dpi=120)
 
 cmap = LinearSegmentedColormap.from_list("rice", ["#d0e8f5", "#08306b"])
 cmap.set_bad(color=(0.96, 0.96, 0.96, 1.0))    # light grey for masked cells
 
-vmin, vmax = 200, float(np.nanmax(arr))
-norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+vmin, vmax = 0, float(np.nanmax(arr))
+norm = mcolors.PowerNorm(gamma=0.45, vmin=vmin, vmax=vmax)
 
 # Raster extent: (left, right, bottom, top) for imshow
 extent = (west, east, south, north)
@@ -195,61 +172,41 @@ casanare_dept.boundary.plot(
     ax=ax, color="#111111", linewidth=2.0, zorder=5
 )
 
-# ── Colorbar (map) ────────────────────────────────────────────────────────────
-cb = fig.colorbar(im, ax=ax, fraction=0.040, pad=0.02, extend="both")
-cb.set_label("Rice ha per 10×10 km cell", fontsize=8)
-cb.ax.tick_params(labelsize=7)
+# ── Colorbar — plain hectare labels, no scientific notation ──────────────────
+cb = fig.colorbar(im, ax=ax, fraction=0.032, pad=0.03, extend="max")
+cb.set_label("Harvested area per cell (ha)", fontsize=9)
 
-# ── Legend (map) ──────────────────────────────────────────────────────────────
+# Place ticks at round hectare values that span the data range
+tick_vals = [0, 500, 1_000, 2_000, 3_000, 5_000, 8_000]
+tick_vals = [t for t in tick_vals if t <= vmax]
+cb.set_ticks(tick_vals)
+cb.set_ticklabels([f"{t:,}" for t in tick_vals])
+cb.ax.tick_params(labelsize=8)
+
+# ── Legend ────────────────────────────────────────────────────────────────────
 legend_elements = [
-    mlines.Line2D([], [], color="#111111", linewidth=2.0, label="Dept. border"),
-    mlines.Line2D([], [], color="#555555", linewidth=0.9, label="Municipality"),
+    mlines.Line2D([], [], color="#111111", linewidth=2.0, label="Casanare dept. border"),
+    mlines.Line2D([], [], color="#555555", linewidth=0.9, label="Municipality border"),
     mlines.Line2D([], [], color="#bbbbbb", linewidth=0.5, label="10 km grid"),
-    Patch(facecolor="#f5f5f5", edgecolor="#aaa", label="<200 ha (masked)"),
+    Patch(facecolor="#f5f5f5", edgecolor="#aaa", label="< 200 ha (not shown)"),
 ]
-ax.legend(handles=legend_elements, loc="lower left", fontsize=7,
-          framealpha=0.92, edgecolor="#ccc")
+ax.legend(handles=legend_elements, loc="lower left", fontsize=8,
+          framealpha=0.93, edgecolor="#ccc")
 
-ax.set_title("Rice harvested area\n10 km × 10 km grid", fontsize=11,
-             fontweight="bold", pad=8)
-ax.set_xlabel("Longitude", fontsize=8)
-ax.set_ylabel("Latitude",  fontsize=8)
+# ── Labels ────────────────────────────────────────────────────────────────────
+ax.set_title("Casanare — Rice Harvested Area\n10 km × 10 km grid  (SPAM2020 demo)",
+             fontsize=13, fontweight="bold", pad=10)
+ax.set_xlabel("Longitude", fontsize=9)
+ax.set_ylabel("Latitude",  fontsize=9)
 ax.set_xlim(west  - 0.05, east  + 0.05)
 ax.set_ylim(south - 0.05, north + 0.05)
-ax.tick_params(labelsize=7)
-
-# ── Bar chart: ha per municipality ───────────────────────────────────────────
-bar_colors = [plt.cm.YlGnBu(0.3 + 0.7 * v / max(muni_values)) for v in muni_values]
-bars = ax2.barh(
-    range(len(muni_names)), muni_values,
-    color=bar_colors, edgecolor="#aaaaaa", linewidth=0.4,
-)
-
-ax2.set_yticks(range(len(muni_names)))
-ax2.set_yticklabels(muni_names, fontsize=8)
-ax2.invert_yaxis()                             # largest at top
-ax2.set_xlabel("Harvested area (thousand ha)", fontsize=10)
-ax2.set_title("Total rice per municipality\n(summed from grid cells)",
-              fontsize=11, fontweight="bold", pad=8)
-ax2.xaxis.grid(True, linestyle="--", alpha=0.5, zorder=0)
-ax2.set_axisbelow(True)
-
-# Value labels on bars
-for i, v in enumerate(muni_values):
-    ax2.text(v + max(muni_values) * 0.01, i, f"{v:.1f}k",
-             va="center", fontsize=7, color="#333")
-
-ax2.spines[["top", "right"]].set_visible(False)
-ax2.tick_params(labelsize=8)
-
-# ── Figure title + footnote ───────────────────────────────────────────────────
-fig.suptitle("Casanare — Rice Harvested Area (SPAM2020 demo)",
-             fontsize=14, fontweight="bold", y=1.01)
-fig.text(0.5, -0.01,
+ax.tick_params(labelsize=8)
+fig.text(0.5, 0.005,
          "Boundaries: geoBoundaries (CC-BY)  |  Values: synthetic demo — replace with SPAM2020",
-         ha="center", fontsize=6.5, color="#777")
+         ha="center", fontsize=7, color="#777")
 
+plt.tight_layout(rect=[0, 0.02, 1, 1])
 out_path = OUT / "casanare_rice_grid.png"
-fig.savefig(out_path, dpi=110, bbox_inches="tight", facecolor="white")
+fig.savefig(out_path, dpi=120, facecolor="white")
 plt.close()
 print(f"\nSaved {out_path}  ({out_path.stat().st_size//1024} KB)")
